@@ -1,12 +1,13 @@
 
-import streamlit as st
-import requests
-import pandas as pd
-import plotly.express as px
 import re
 import html
-import time
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
 
 
 # ==========================================
@@ -14,198 +15,175 @@ from datetime import date
 # ==========================================
 
 st.set_page_config(
-    page_title="우리 학교 메뉴별 급식",
-    page_icon="🍱",
+    page_title="날짜별 중식 단백질 함량",
+    page_icon="🥚",
     layout="wide"
 )
 
-st.title("🍱 우리 학교 메뉴별 급식")
+st.title("🥚 나는 어느 날에 단백질 함량이 높을까?")
 st.write(
-    "송탄고등학교에서 2025년 9월부터 2026년 9월까지 "
-    "가장 자주 나온 중식 메뉴를 알아봅니다."
+    "송탄고등학교의 날짜별 중식 단백질 함량을 비교해 보세요."
 )
 
-SCHOOL_NAME = "송탄고등학교"
+API_URL = "https://open.neis.go.kr/hub/mealServiceDietInfo"
 
-ATPT_OFCDC_SC_CODE = "J10"
-SD_SCHUL_CODE = "7530480"
+OFFICE_CODE = "J10"
+SCHOOL_CODE = "7530480"
 
-MEAL_API = (
-    "https://open.neis.go.kr/hub/mealServiceDietInfo"
-)
+KOREA_TZ = ZoneInfo("Asia/Seoul")
+TODAY = datetime.now(KOREA_TZ).date()
 
-START_DATE = "20250901"
-END_DATE = "20260930"
-
-# 한 번에 요청할 행 수
-PAGE_SIZE = 1000
-
-TIMEOUT = 30
+TIMEOUT = 20
 
 
 # ==========================================
-# 메뉴 이름 정리
+# 날짜와 영양정보 처리
 # ==========================================
 
-def clean_menu_name(menu):
+def parse_protein(nutrition_text):
     """
-    메뉴 이름에서 HTML 태그와 알레르기 번호를 제거한다.
+    NTR_INFO에서 단백질(g) 값을 추출한다.
+    예: 단백질(g) : 48.5
     """
 
-    if not menu:
-        return ""
+    if not nutrition_text:
+        return None
 
-    menu = html.unescape(str(menu))
+    text = html.unescape(str(nutrition_text))
 
-    # HTML 태그 제거
-    menu = re.sub(
-        r"<[^>]*>",
-        "",
-        menu
+    # 영양정보 항목을 줄 단위로 분리
+    text = re.sub(
+        r"(?i)<br\s*/?>",
+        "\n",
+        text
     )
 
-    menu = menu.strip()
-
-    # 메뉴 뒤에 붙은 알레르기 번호 제거
-    # 예: 달걀말이(1.2.5) -> 달걀말이
-    menu = re.sub(
-        r"\s*\(\s*\d+(?:\.\d+)*\s*\)\s*$",
+    text = re.sub(
+        r"<[^>]*>",
         "",
-        menu
-    ).strip()
+        text
+    )
 
-    return menu
+    for line in text.splitlines():
+
+        if "단백질" not in line:
+            continue
+
+        match = re.search(
+            r"단백질\s*\(\s*g\s*\)\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+            line
+        )
+
+        if match:
+            return float(match.group(1))
+
+    return None
 
 
-def split_menu(menu_text):
+def parse_menu(menu_text):
     """
-    <br/> 기준으로 메뉴를 나눈다.
+    메뉴 문자열을 줄 단위로 나눈다.
     """
 
     if not menu_text:
         return []
 
-    menu_text = html.unescape(str(menu_text))
+    text = html.unescape(str(menu_text))
 
-    menu_text = re.sub(
+    text = re.sub(
         r"(?i)<br\s*/?>",
         "\n",
-        menu_text
+        text
     )
 
-    items = []
-
-    for item in menu_text.splitlines():
-
-        cleaned = clean_menu_name(item)
-
-        if cleaned:
-            items.append(cleaned)
-
-    return items
-
-
-# ==========================================
-# 나이스 API 호출
-# ==========================================
-
-def request_meal_page(api_key, page_index):
-    """
-    급식 API의 특정 페이지를 요청한다.
-    """
-
-    params = {
-        "KEY": api_key,
-        "Type": "json",
-        "ATPT_OFCDC_SC_CODE": ATPT_OFCDC_SC_CODE,
-        "SD_SCHUL_CODE": SD_SCHUL_CODE,
-        "MMEAL_SC_CODE": "2",
-        "MLSV_FROM_YMD": START_DATE,
-        "MLSV_TO_YMD": END_DATE,
-        "pSize": str(PAGE_SIZE),
-        "pIndex": str(page_index)
-    }
-
-    response = requests.get(
-        MEAL_API,
-        params=params,
-        timeout=TIMEOUT
+    text = re.sub(
+        r"<[^>]*>",
+        "",
+        text
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    # 조회 결과가 없는 경우
-    result = data.get("RESULT", {})
-
-    if result.get("CODE") == "INFO-200":
-        return [], 0
-
-    # 다른 API 오류
-    if result.get("CODE"):
-        raise RuntimeError(
-            f"{result.get('MESSAGE', '나이스 API 오류')} "
-            f"({result.get('CODE')})"
-        )
-
-    meal_info = data.get(
-        "mealServiceDietInfo",
-        []
-    )
-
-    if not meal_info:
-        return [], 0
-
-    # 전체 건수 확인
-    head = meal_info[0].get("head", [])
-
-    total_count = 0
-
-    for item in head:
-        if "list_total_count" in item:
-            total_count = int(
-                item["list_total_count"]
-            )
-            break
-
-    # 급식 행 데이터
-    rows = []
-
-    if len(meal_info) >= 2:
-        rows = meal_info[1].get("row", [])
-
-    return rows, total_count
+    return [
+        item.strip()
+        for item in text.splitlines()
+        if item.strip()
+    ]
 
 
 # ==========================================
-# 전체 급식 데이터 수집
+# 나이스 API 조회
 # ==========================================
 
-@st.cache_data(
-    ttl=3600,
-    show_spinner=False
-)
-def load_all_meals(api_key):
-    """
-    전체 건수만큼 모든 페이지를 요청한다.
-    """
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_meals(start_date, end_date, api_key):
 
     all_rows = []
-    page_index = 1
+    page = 1
     total_count = None
+    page_size = 1000
 
     while True:
 
-        rows, current_total = request_meal_page(
-            api_key,
-            page_index
+        params = {
+            "KEY": api_key,
+            "Type": "json",
+            "pIndex": page,
+            "pSize": page_size,
+            "ATPT_OFCDC_SC_CODE": OFFICE_CODE,
+            "SD_SCHUL_CODE": SCHOOL_CODE,
+            "MMEAL_SC_CODE": "2",
+            "MLSV_FROM_YMD": start_date,
+            "MLSV_TO_YMD": end_date
+        }
+
+        response = requests.get(
+            API_URL,
+            params=params,
+            timeout=TIMEOUT
         )
 
-        if total_count is None:
-            total_count = current_total
+        response.raise_for_status()
 
-        # 데이터가 없는 경우
+        data = response.json()
+
+        # 조회 결과 없음
+        result = data.get("RESULT", {})
+
+        if result.get("CODE") == "INFO-200":
+            return []
+
+        if result.get("CODE"):
+            raise ValueError(
+                f"{result.get('MESSAGE', '나이스 API 오류')} "
+                f"({result.get('CODE')})"
+            )
+
+        meal_info = data.get(
+            "mealServiceDietInfo",
+            []
+        )
+
+        if not meal_info:
+            return all_rows
+
+        # 첫 페이지에서 전체 건수 확인
+        if total_count is None:
+
+            head = meal_info[0].get("head", [])
+
+            total_count = next(
+                (
+                    int(item["list_total_count"])
+                    for item in head
+                    if "list_total_count" in item
+                ),
+                0
+            )
+
+        if len(meal_info) < 2:
+            break
+
+        rows = meal_info[1].get("row", [])
+
         if not rows:
             break
 
@@ -215,303 +193,219 @@ def load_all_meals(api_key):
         if len(all_rows) >= total_count:
             break
 
-        # 다음 페이지
-        page_index += 1
+        page += 1
 
-        # API 요청 간 짧은 간격
-        time.sleep(0.1)
-
-    return all_rows, total_count or 0
+    return all_rows
 
 
 # ==========================================
-# 데이터 집계
+# 데이터프레임 만들기
 # ==========================================
 
-def make_statistics(rows):
-    """
-    같은 날짜에 같은 메뉴가 여러 번 있어도
-    하루에 한 번만 집계한다.
-    """
+def make_dataframe(rows):
 
     records = []
 
     for row in rows:
 
-        # 중식만 집계
+        # 중식만 사용
         if row.get("MMEAL_SC_CODE") != "2":
             continue
 
-        meal_date = row.get("MLSV_YMD", "")
-        menu_text = row.get("DDISH_NM", "")
+        date_text = row.get("MLSV_YMD", "")
+        protein = parse_protein(
+            row.get("NTR_INFO", "")
+        )
 
-        if not meal_date:
+        if not date_text or protein is None:
             continue
 
-        menus = split_menu(menu_text)
+        try:
+            meal_date = pd.to_datetime(
+                date_text,
+                format="%Y%m%d"
+            )
+        except ValueError:
+            continue
 
-        # 같은 날짜의 중복 메뉴 제거
-        unique_menus = set(menus)
+        menus = parse_menu(
+            row.get("DDISH_NM", "")
+        )
 
-        for menu in unique_menus:
-
-            records.append({
-                "날짜": meal_date,
-                "메뉴": menu
-            })
-
-    if not records:
-        return pd.DataFrame(), 0
+        records.append({
+            "날짜": meal_date,
+            "단백질 함량(g)": protein,
+            "메뉴": ", ".join(menus)
+        })
 
     df = pd.DataFrame(records)
 
-    # 같은 날짜와 같은 메뉴가 중복되지 않도록 처리
-    df = df.drop_duplicates(
-        subset=["날짜", "메뉴"]
+    if df.empty:
+        return df
+
+    # 같은 날짜에 중식 데이터가 여러 건이면
+    # 해당 날짜의 단백질 합계로 표시
+    df = (
+        df.groupby("날짜", as_index=False)
+        .agg({
+            "단백질 함량(g)": "sum",
+            "메뉴": lambda values: " / ".join(values)
+        })
     )
 
-    # 급식이 등록된 날짜 수
-    total_days = df["날짜"].nunique()
+    df = df.sort_values("날짜")
 
-    # 메뉴별 등장 일수
-    stats = (
-        df.groupby("메뉴")["날짜"]
-        .nunique()
-        .reset_index(name="등장 일수")
-    )
-
-    # 전체 급식일 대비 비율
-    stats["비율"] = (
-        stats["등장 일수"] / total_days * 100
-    )
-
-    # 등장 일수 내림차순
-    stats = stats.sort_values(
-        ["등장 일수", "메뉴"],
-        ascending=[False, True]
-    ).reset_index(drop=True)
-
-    stats["순위"] = range(1, len(stats) + 1)
-
-    return stats, total_days
+    return df
 
 
 # ==========================================
-# API 인증키 확인
+# 인증키 확인
 # ==========================================
 
 try:
     API_KEY = st.secrets["NEIS_API_KEY"]
 
 except Exception:
-    API_KEY = None
-
-
-if not API_KEY:
-
     st.error(
-        "NEIS_API_KEY를 Streamlit Secrets에 설정해 주세요."
+        "Streamlit Secrets에 NEIS_API_KEY를 등록해 주세요."
     )
-
-    st.info(
-        "Streamlit Cloud의 앱 설정에서 "
-        "NEIS_API_KEY를 등록하면 됩니다."
-    )
-
     st.stop()
 
 
 # ==========================================
-# 데이터 불러오기
+# 날짜 선택
 # ==========================================
 
-st.subheader("📊 메뉴별 등장 횟수 분석")
+st.subheader("📅 조회 기간")
 
-st.caption(
-    "분석 기간: 2025년 9월 1일 ~ 2026년 9월 30일"
-)
+date_col1, date_col2 = st.columns(2)
+
+with date_col1:
+    start_date = st.date_input(
+        "시작 날짜",
+        value=date(2025, 9, 1),
+        max_value=TODAY
+    )
+
+with date_col2:
+    end_date = st.date_input(
+        "끝 날짜",
+        value=TODAY,
+        min_value=start_date,
+        max_value=TODAY
+    )
+
+if start_date > end_date:
+    st.warning("시작 날짜가 끝 날짜보다 늦을 수 없습니다.")
+    st.stop()
+
+
+# ==========================================
+# 데이터 조회
+# ==========================================
 
 try:
 
-    with st.spinner(
-        "송탄고등학교의 전체 중식 데이터를 불러오는 중입니다..."
-    ):
+    with st.spinner("급식 영양정보를 불러오는 중입니다..."):
 
-        rows, total_count = load_all_meals(
+        rows = load_meals(
+            start_date.strftime("%Y%m%d"),
+            end_date.strftime("%Y%m%d"),
             API_KEY
         )
 
 except requests.exceptions.Timeout:
-
-    st.error(
-        "나이스 서버 응답 시간이 초과되었습니다. "
-        "잠시 후 다시 시도해 주세요."
-    )
-
+    st.error("나이스 서버 응답 시간이 초과되었습니다.")
     st.stop()
 
 except requests.exceptions.RequestException:
-
-    st.error(
-        "나이스 서버에 연결할 수 없습니다. "
-        "인터넷 연결을 확인해 주세요."
-    )
-
+    st.error("나이스 서버에 연결할 수 없습니다.")
     st.stop()
 
-except Exception as e:
-
-    st.error(
-        f"급식 데이터를 불러오는 중 오류가 발생했습니다: {e}"
-    )
-
+except Exception as error:
+    st.error(f"데이터 조회 오류: {error}")
     st.stop()
 
 
-if not rows:
+df = make_dataframe(rows)
 
+if df.empty:
     st.info(
-        "선택한 기간에 등록된 중식 급식 데이터가 없습니다."
+        "선택한 기간에 단백질 영양정보가 등록된 중식이 없습니다."
     )
-
     st.stop()
 
 
 # ==========================================
-# 집계 결과 만들기
+# 요약 카드
 # ==========================================
 
-stats, total_days = make_statistics(rows)
+highest = df.loc[
+    df["단백질 함량(g)"].idxmax()
+]
 
-if stats.empty:
+average_protein = df["단백질 함량(g)"].mean()
 
-    st.info(
-        "집계할 수 있는 중식 메뉴가 없습니다."
-    )
+st.subheader("📊 단백질 함량 요약")
 
-    st.stop()
+col1, col2, col3 = st.columns(3)
 
-
-# ==========================================
-# TOP 메뉴 슬라이더
-# ==========================================
-
-max_rank = min(50, len(stats))
-
-selected_rank = st.slider(
-    "그래프에 표시할 메뉴 순위",
-    min_value=1,
-    max_value=max_rank,
-    value=min(10, max_rank),
-    step=1
+col1.metric(
+    "집계한 급식일",
+    f"{len(df)}일"
 )
 
-top_menus = stats.head(
-    selected_rank
-).copy()
+col2.metric(
+    "평균 단백질 함량",
+    f"{average_protein:.1f}g"
+)
+
+col3.metric(
+    "단백질이 가장 높은 날",
+    highest["날짜"].strftime("%Y-%m-%d"),
+    f"{highest['단백질 함량(g)']:.1f}g"
+)
 
 
 # ==========================================
-# 큰 숫자 카드
+# 날짜별 선그래프
 # ==========================================
-
-first_menu = stats.iloc[0]
-
-first_menu_name = first_menu["메뉴"]
-first_menu_days = int(first_menu["등장 일수"])
-first_menu_ratio = float(first_menu["비율"])
-
-st.subheader("🏆 분석 결과")
-
-metric1, metric2, metric3 = st.columns(3)
-
-with metric1:
-    st.metric(
-        "집계한 날수",
-        f"{total_days:,}일"
-    )
-
-with metric2:
-    st.metric(
-        "1위 메뉴",
-        first_menu_name
-    )
-
-with metric3:
-    st.metric(
-        "1위 메뉴 비율",
-        f"{first_menu_ratio:.1f}%"
-    )
-
 
 st.divider()
 
+st.subheader("📈 날짜별 중식 단백질 함량")
 
-# ==========================================
-# 가로 막대그래프
-# ==========================================
-
-st.subheader(
-    f"🥇 자주 나온 메뉴 TOP {selected_rank}"
-)
-
-# 그래프는 1위가 위에 오도록 순서를 뒤집는다.
-chart_df = top_menus.sort_values(
-    "등장 일수",
-    ascending=True
-).copy()
-
-chart_df["순위 메뉴"] = (
-    chart_df["순위"].astype(str)
-    + "위 "
-    + chart_df["메뉴"]
-)
-
-# 값이 클수록 진한 색
-fig = px.bar(
-    chart_df,
-    x="등장 일수",
-    y="순위 메뉴",
-    orientation="h",
-    color="등장 일수",
-    color_continuous_scale="Blues",
-    text="등장 일수",
+fig = px.line(
+    df,
+    x="날짜",
+    y="단백질 함량(g)",
+    markers=True,
     hover_data={
-        "메뉴": True,
-        "등장 일수": True,
-        "비율": ":.1f",
-        "순위 메뉴": False
+        "날짜": "|%Y-%m-%d",
+        "단백질 함량(g)": ":.1f",
+        "메뉴": True
     },
     labels={
-        "등장 일수": "등장 일수",
-        "순위 메뉴": "메뉴"
+        "날짜": "날짜",
+        "단백질 함량(g)": "단백질 함량(g)"
     }
 )
 
 fig.update_traces(
-    texttemplate="%{text}일",
-    textposition="outside",
-    cliponaxis=False
+    line_width=3,
+    marker_size=6,
+    hovertemplate=(
+        "날짜: %{x|%Y-%m-%d}<br>"
+        "단백질: %{y:.1f}g"
+        "<extra></extra>"
+    )
 )
 
 fig.update_layout(
-    height=max(450, selected_rank * 42),
-    coloraxis_showscale=False,
-    yaxis={
-        "title": "",
-        "categoryorder": "array",
-        "categoryarray": chart_df["순위 메뉴"].tolist()
-    },
-    xaxis={
-        "title": "등장 일수",
-        "rangemode": "tozero"
-    },
-    margin={
-        "l": 20,
-        "r": 60,
-        "t": 20,
-        "b": 20
-    }
+    height=500,
+    xaxis_title="날짜",
+    yaxis_title="단백질 함량(g)",
+    hovermode="x unified"
 )
 
 st.plotly_chart(
@@ -521,26 +415,74 @@ st.plotly_chart(
 
 
 # ==========================================
-# 메뉴별 등장 일수와 비율
+# 단백질이 높은 날짜 TOP 10
 # ==========================================
 
-st.subheader("📋 메뉴별 등장 일수와 비율")
+st.divider()
 
-display_df = top_menus[
-    ["순위", "메뉴", "등장 일수", "비율"]
-].copy()
+st.subheader("🏆 단백질 함량이 높은 날 TOP 10")
 
-display_df["비율"] = display_df["비율"].map(
-    lambda value: f"{value:.1f}%"
+top10 = (
+    df.sort_values(
+        "단백질 함량(g)",
+        ascending=False
+    )
+    .head(10)
+    .copy()
 )
 
-display_df = display_df.rename(
-    columns={
-        "순위": "순위",
-        "메뉴": "메뉴 이름",
-        "등장 일수": "등장 일수",
-        "비율": "비율"
-    }
+top10["날짜"] = top10["날짜"].dt.strftime(
+    "%Y-%m-%d"
+)
+
+fig_top = px.bar(
+    top10.sort_values(
+        "단백질 함량(g)",
+        ascending=True
+    ),
+    x="단백질 함량(g)",
+    y="날짜",
+    orientation="h",
+    color="단백질 함량(g)",
+    color_continuous_scale="Greens",
+    text="단백질 함량(g)",
+    hover_data=["메뉴"]
+)
+
+fig_top.update_traces(
+    texttemplate="%{text:.1f}g",
+    textposition="outside"
+)
+
+fig_top.update_layout(
+    height=450,
+    coloraxis_showscale=False,
+    xaxis_title="단백질 함량(g)",
+    yaxis_title=""
+)
+
+st.plotly_chart(
+    fig_top,
+    use_container_width=True
+)
+
+
+# ==========================================
+# 날짜별 메뉴와 단백질 표
+# ==========================================
+
+st.divider()
+
+st.subheader("📋 날짜별 급식 영양정보")
+
+display_df = df.copy()
+
+display_df["날짜"] = display_df["날짜"].dt.strftime(
+    "%Y-%m-%d"
+)
+
+display_df["단백질 함량(g)"] = (
+    display_df["단백질 함량(g)"].round(1)
 )
 
 st.dataframe(
@@ -557,15 +499,15 @@ st.dataframe(
 st.divider()
 
 st.caption(
-    "※ 같은 날 같은 메뉴가 여러 번 기록되어도 하루로 계산합니다."
+    "※ 단백질 함량은 나이스에 등록된 중식 영양정보 기준입니다."
 )
 
 st.caption(
-    "※ 비율은 해당 기간에 급식이 등록된 날짜 수를 기준으로 계산합니다."
+    "※ 실제로 먹은 양에 따라 섭취한 단백질 양은 달라질 수 있습니다."
 )
 
 st.caption(
-    "※ 메뉴 이름 뒤 괄호 속 알레르기 번호는 집계에서 제거합니다."
+    "※ 영양정보가 등록되지 않은 날짜는 그래프에서 제외됩니다."
 )
 
 st.caption(
