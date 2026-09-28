@@ -1,7 +1,7 @@
 
 import html
 import re
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -13,7 +13,7 @@ import streamlit as st
 # 기본 설정
 # --------------------------------------------------
 st.set_page_config(
-    page_title="날짜별 중식 단백질 분석",
+    page_title="날짜별 중식 단백질 함량",
     page_icon="🥗",
     layout="wide",
 )
@@ -21,7 +21,6 @@ st.set_page_config(
 st.title("🥗 날짜별 중식 단백질 함량")
 st.caption("송탄고등학교의 날짜별 중식 단백질 함량을 비교해 보세요.")
 
-# 송탄고등학교
 ATPT_OFCDC_SC_CODE = "J10"
 SD_SCHUL_CODE = "7530480"
 
@@ -35,10 +34,6 @@ DEFAULT_START = date(2025, 9, 1)
 # 단백질 함량 추출
 # --------------------------------------------------
 def parse_protein(ntr_info):
-    """
-    NEIS 영양정보에서 단백질(g) 수치를 추출합니다.
-    예: 단백질(g) : 48.5
-    """
     if not ntr_info:
         return None
 
@@ -50,6 +45,7 @@ def parse_protein(ntr_info):
         r"단백질\s*\(\s*g\s*\)\s*[:：]\s*"
         r"([0-9]+(?:\.[0-9]+)?)"
     )
+
     match = re.search(pattern, text, flags=re.IGNORECASE)
 
     if match:
@@ -59,16 +55,26 @@ def parse_protein(ntr_info):
 
 
 # --------------------------------------------------
-# NEIS 급식 영양정보 조회
+# 나이스 API 호출
 # --------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_protein_data(start_date, end_date):
+    api_key = st.secrets.get("NEIS_API_KEY", "")
+
+    if not api_key:
+        raise RuntimeError(
+            "Streamlit Secrets에서 NEIS_API_KEY를 찾을 수 없습니다. "
+            "앱 설정의 Secrets에 인증키가 등록되어 있는지 확인해 주세요."
+        )
+
     all_rows = []
     page = 1
     page_size = 1000
 
     while True:
         params = {
+            "KEY": api_key,
+            "Type": "json",
             "ATPT_OFCDC_SC_CODE": ATPT_OFCDC_SC_CODE,
             "SD_SCHUL_CODE": SD_SCHUL_CODE,
             "MLSV_FROM_YMD": start_date.strftime("%Y%m%d"),
@@ -81,26 +87,62 @@ def load_protein_data(start_date, end_date):
             response = requests.get(
                 API_URL,
                 params=params,
-                timeout=20,
+                timeout=30,
             )
-            response.raise_for_status()
-            result = response.json()
         except requests.RequestException as error:
             raise RuntimeError(
-                f"나이스 API에 연결하지 못했습니다.\n{error}"
-            ) from error
-        except ValueError as error:
-            raise RuntimeError(
-                "나이스 API 응답을 읽을 수 없습니다."
+                f"나이스 API에 연결하지 못했습니다: {error}"
             ) from error
 
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"나이스 API 응답 오류입니다. "
+                f"HTTP 상태 코드: {response.status_code}"
+            )
+
+        response_text = response.text.strip()
+
+        if not response_text:
+            raise RuntimeError(
+                "나이스 API가 빈 응답을 반환했습니다. "
+                "인증키와 API 주소를 확인한 뒤 다시 시도해 주세요."
+            )
+
+        try:
+            result = response.json()
+        except requests.exceptions.JSONDecodeError as error:
+            preview = response_text[:300]
+            raise RuntimeError(
+                "나이스 API 응답을 JSON으로 읽을 수 없습니다.\n\n"
+                f"응답 내용 일부: {preview}"
+            ) from error
+
+        # 정상적인 급식 자료가 없는 경우
         meal_info = result.get("mealServiceDietInfo")
 
-        # 급식 정보가 없거나 API가 오류를 반환한 경우
-        if not meal_info or len(meal_info) < 2:
+        if not meal_info:
+            # API 오류 응답의 원인을 확인
+            result_info = result.get("RESULT")
+
+            if result_info:
+                code = result_info.get("CODE", "")
+                message = result_info.get("MESSAGE", "")
+
+                if code == "INFO-200":
+                    break
+
+                raise RuntimeError(
+                    f"나이스 API 오류: {code} - {message}"
+                )
+
+            # 급식 자료가 없는 응답이면 종료
+            break
+
+        if len(meal_info) < 2:
             break
 
         rows = meal_info[1].get("row", [])
+
         if not rows:
             break
 
@@ -120,11 +162,11 @@ def load_protein_data(start_date, end_date):
 
         protein = parse_protein(row.get("NTR_INFO"))
 
-        # 단백질 수치가 없는 식단은 분석에서 제외
         if protein is None:
             continue
 
         meal_date = row.get("MLSV_YMD")
+
         if not meal_date:
             continue
 
@@ -149,21 +191,17 @@ def load_protein_data(start_date, end_date):
     df = pd.DataFrame(records)
     df = df.dropna(subset=["날짜"])
 
-    # 같은 날짜에 자료가 여러 개 있으면 단백질 함량을 합산
+    # 날짜별로 정리
     df = (
         df.groupby("날짜", as_index=False)
         .agg(
             {
                 "단백질(g)": "sum",
                 "메뉴": lambda values: " / ".join(
-                    str(value)
-                    for value in values
-                    if value
+                    str(value) for value in values if value
                 ),
                 "칼로리": lambda values: " / ".join(
-                    str(value)
-                    for value in values
-                    if value
+                    str(value) for value in values if value
                 ),
             }
         )
@@ -174,7 +212,7 @@ def load_protein_data(start_date, end_date):
 
 
 # --------------------------------------------------
-# 조회 기간 선택
+# 조회 기간
 # --------------------------------------------------
 st.header("🗓️ 조회 기간")
 
@@ -220,32 +258,21 @@ if df.empty:
 st.subheader("📌 조회 결과")
 
 average_protein = df["단백질(g)"].mean()
-max_index = df["단백질(g)"].idxmax()
-max_row = df.loc[max_index]
+max_row = df.loc[df["단백질(g)"].idxmax()]
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.metric(
-        "중식 평균 단백질",
-        f"{average_protein:.1f} g",
-    )
+    st.metric("중식 평균 단백질", f"{average_protein:.1f} g")
 
 with col2:
-    st.metric(
-        "가장 높은 단백질 함량",
-        f"{max_row['단백질(g)']:.1f} g",
-    )
+    st.metric("가장 높은 단백질 함량", f"{max_row['단백질(g)']:.1f} g")
 
 with col3:
-    st.metric(
-        "분석한 급식 날짜",
-        f"{len(df)}일",
-    )
+    st.metric("분석한 급식 날짜", f"{len(df)}일")
 
 st.caption(
-    f"조회 기간: {start_date.strftime('%Y-%m-%d')} ~ "
-    f"{end_date.strftime('%Y-%m-%d')}"
+    f"조회 기간: {start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}"
 )
 
 
@@ -286,7 +313,7 @@ st.plotly_chart(line_fig, use_container_width=True)
 
 
 # --------------------------------------------------
-# 그래프 2: 단백질 함량이 높은 날짜 TOP 10
+# 그래프 2: 단백질 함량 TOP 10
 # --------------------------------------------------
 st.subheader("🏆 단백질 함량이 높은 날짜 TOP 10")
 
@@ -349,6 +376,6 @@ st.dataframe(
 )
 
 st.caption(
-    "※ 단백질 함량은 나이스 급식 영양정보에 표시된 값을 사용합니다. "
-    "영양정보가 없는 날짜는 그래프와 표에서 제외됩니다."
+    "※ 나이스 급식 영양정보에 표시된 단백질 함량을 사용합니다. "
+    "영양정보가 없는 날짜는 분석에서 제외됩니다."
 )
